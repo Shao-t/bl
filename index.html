@@ -56,31 +56,56 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { Sky } from 'three/addons/objects/Sky.js';
 
 
 // ---------------------------------------------------------------- renderer / scene
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.68;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
-const DAY = new THREE.Color('#9cc4ec'), NIGHT = new THREE.Color('#0b1226');
+const DAY = new THREE.Color('#c4d9ea'), NIGHT = new THREE.Color('#0b1226');
 scene.background = DAY.clone();
 scene.fog = new THREE.Fog(DAY.clone(), 900, 3200);
 
 const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const SUN_DIR = new THREE.Vector3(300, 500, 200).normalize();
+function makeSky() {
+  const s = new Sky();
+  s.scale.setScalar(5000);
+  const u = s.material.uniforms;
+  u.turbidity.value = 2; u.rayleigh.value = 2.6;
+  u.mieCoefficient.value = 0.004; u.mieDirectionalG.value = 0.8;
+  u.sunPosition.value.copy(SUN_DIR);
+  return s;
+}
+const sky = makeSky();
+scene.add(sky);
+const envScene = new THREE.Scene();
+envScene.add(makeSky());
+scene.environment = pmrem.fromScene(envScene, 0.02).texture;
 
 const hemi = new THREE.HemisphereLight(0xcfe3ff, 0x778877, 0.9);
 const sun = new THREE.DirectionalLight(0xffffff, 1.8);
 sun.position.set(300, 500, 200);
-scene.add(hemi, sun);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -280, right: 280, top: 280, bottom: -280, near: 10, far: 1500 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.25;
+sun.target.position.set(0, 150, 0);
+scene.add(hemi, sun, sun.target);
 
 const ground = new THREE.Mesh(
   new THREE.CircleGeometry(4000, 64).rotateX(-Math.PI / 2),
   new THREE.MeshStandardMaterial({ color: 0x8fa58a, roughness: 1, metalness: 0 })
 );
 ground.position.y = -0.05;
+ground.receiveShadow = true;
 scene.add(ground);
 
 const camera = new THREE.PerspectiveCamera(40, 1, 1, 6000);
@@ -102,6 +127,39 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 resize();
+
+// ---------------------------------------------------------------- 材質磨損（世界座標程序化噪聲，無需貼圖/UV）
+const NOISE_GLSL = `
+float h31(vec3 p){p=fract(p*0.3183099+.1);p*=17.0;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float vn(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+  return mix(mix(mix(h31(i),h31(i+vec3(1,0,0)),f.x),mix(h31(i+vec3(0,1,0)),h31(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(h31(i+vec3(0,0,1)),h31(i+vec3(1,0,1)),f.x),mix(h31(i+vec3(0,1,1)),h31(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p){float a=.5,s=0.;for(int i=0;i<4;i++){s+=a*vn(p);p*=2.03;a*=.5;}return s;}`;
+function addWear(mat) {
+  if (mat.userData.worn || !mat.isMeshStandardMaterial) return;
+  if (mat.emissive && mat.emissive.getHex() > 0) return;   // 燈光/航空障礙燈不加髒汙
+  mat.userData.worn = true;
+  mat.customProgramCacheKey = () => 'wear';
+  mat.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWP;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWP = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWP;\n' + NOISE_GLSL)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        float streak = fbm(vec3(vWP.x*0.9, vWP.y*0.05, vWP.z*0.9));
+        float blot = fbm(vWP*0.3 + 7.0);
+        float fine = vn(vWP*5.0);
+        float grime = smoothstep(.38, .8, streak*.8 + blot*.4) * (1.0 - .5*smoothstep(0., 150., vWP.y));
+        float fade = smoothstep(.55, .9, blot);
+        diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb*vec3(.38,.34,.30), grime*.85);
+        diffuseColor.rgb *= .94 + .12*fine;
+        diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(.33))) + .03, fade*.28);`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+        roughnessFactor = clamp(roughnessFactor + grime*.35 + (fine-.5)*.3 + fade*.15, .25, 1.);`);
+  };
+  mat.needsUpdate = true;
+}
 
 // ---------------------------------------------------------------- model
 let tower = null;
@@ -163,7 +221,7 @@ function loadModel(m) {
     tower = gltf.scene;
     tower.traverse((o) => {
       if (o.name && o.name.startsWith('G_')) groups[o.name] = o;
-      if (o.isMesh && o.material) o.material.envMapIntensity = 0.45;
+      if (o.isMesh) { o.castShadow = o.receiveShadow = true; [].concat(o.material).forEach(addWear); }
     });
     scene.add(tower);
     setNight(state.night);
@@ -186,7 +244,9 @@ function setNight(on) {
   scene.fog.color.copy(c);
   hemi.intensity = on ? 0.18 : 0.9;
   sun.intensity = on ? 0.15 : 1.8;
-  ground.material.color.set(on ? 0x1d2a22 : 0x8fa58a);
+  ground.material.color.set(on ? 0x1d2a22 : 0x94a07c);
+  sky.visible = !on;
+  if (tower) tower.traverse((o) => { if (o.isMesh) [].concat(o.material).forEach((m) => { m.envMapIntensity = on ? 0.06 : 0.4; }); });
   if (groups.G_NightLights) groups.G_NightLights.visible = on;
 }
 function setBtn(name, on) {
